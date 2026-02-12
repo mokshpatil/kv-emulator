@@ -4,10 +4,10 @@ from dataclasses import dataclass, field
 @dataclass
 class Metrics:
     # flash read counters
-    tp_reads: int = 0               # translation page reads
-    data_reads: int = 0             # data page reads
-    flash_writes: int = 0           # total flash page writes
-    flash_erases: int = 0           # block erases
+    tp_reads: int = 0
+    data_reads: int = 0
+    flash_writes: int = 0
+    flash_erases: int = 0
 
     # CMT counters
     cmt_hits: int = 0
@@ -17,15 +17,24 @@ class Metrics:
     total_puts: int = 0
     total_gets: int = 0
     total_deletes: int = 0
-    inline_entries: int = 0         # current count of inline entries
-    regular_entries: int = 0        # current count of regular entries
-    inline_to_regular: int = 0      # eviction conversions
+    inline_entries: int = 0
+    regular_entries: int = 0
+    inline_to_regular: int = 0
 
-    # per-request tracking for current request
+    # GC counters
+    gc_invocations: int = 0
+    gc_pages_copied: int = 0
+    host_writes: int = 0
+
+    # per-request state
     _request_flash_reads: int = field(default=0, repr=False)
 
-    # histogram: requests by flash read count
+    # histogram: GET requests by flash read count
     reads_by_flash_count: dict = field(default_factory=lambda: {0: 0, 1: 0, 2: 0})
+
+    # latency tracking: list of per-GET latencies in microseconds
+    _get_latencies: list = field(default_factory=list, repr=False)
+    read_latency_us: float = field(default=45.0, repr=False)
 
     @property
     def total_flash_reads(self):
@@ -46,13 +55,44 @@ class Metrics:
         return self.inline_entries / total if total > 0 else 0.0
 
     @property
+    def waf(self):
+        if self.host_writes == 0:
+            return 0.0
+        return self.flash_writes / self.host_writes
+
+    @property
     def reads_with_one_or_fewer(self):
-        # percentage of GET requests completing in <= 1 flash read
         total = sum(self.reads_by_flash_count.values())
         if total == 0:
             return 0.0
         good = self.reads_by_flash_count.get(0, 0) + self.reads_by_flash_count.get(1, 0)
         return good / total
+
+    @property
+    def avg_read_latency(self):
+        if not self._get_latencies:
+            return 0.0
+        return sum(self._get_latencies) / len(self._get_latencies)
+
+    @property
+    def p50_read_latency(self):
+        return self._percentile(50)
+
+    @property
+    def p99_read_latency(self):
+        return self._percentile(99)
+
+    @property
+    def p999_read_latency(self):
+        return self._percentile(99.9)
+
+    def _percentile(self, pct):
+        if not self._get_latencies:
+            return 0.0
+        s = sorted(self._get_latencies)
+        idx = int(len(s) * pct / 100)
+        idx = min(idx, len(s) - 1)
+        return s[idx]
 
     def begin_request(self):
         self._request_flash_reads = 0
@@ -69,6 +109,22 @@ class Metrics:
         if count not in self.reads_by_flash_count:
             self.reads_by_flash_count[count] = 0
         self.reads_by_flash_count[count] += 1
+        latency = count * self.read_latency_us
+        self._get_latencies.append(latency)
+
+    def latency_cdf(self, buckets=50):
+        # return (latency, fraction) pairs for plotting
+        if not self._get_latencies:
+            return []
+        s = sorted(self._get_latencies)
+        n = len(s)
+        step = max(1, n // buckets)
+        points = []
+        for i in range(0, n, step):
+            points.append((s[i], (i + 1) / n))
+        if points[-1][1] < 1.0:
+            points.append((s[-1], 1.0))
+        return points
 
     def summary(self):
         return {
@@ -85,7 +141,10 @@ class Metrics:
             "regular_entries": self.regular_entries,
             "inline_to_regular": self.inline_to_regular,
             "reads_leq_1_flash": f"{self.reads_with_one_or_fewer:.4f}",
-            "reads_by_flash_count": dict(sorted(self.reads_by_flash_count.items())),
+            "avg_latency_us": f"{self.avg_read_latency:.1f}",
+            "p50_latency_us": f"{self.p50_read_latency:.1f}",
+            "p99_latency_us": f"{self.p99_read_latency:.1f}",
+            "waf": f"{self.waf:.2f}",
         }
 
     def print_summary(self):

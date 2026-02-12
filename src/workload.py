@@ -77,21 +77,24 @@ def uniform_workload(
             yield Operation("put", key, key_size, value_size)
 
 
-def trace_workload(trace_path: str):
+def trace_workload(trace_path: str, max_ops: int = 0):
     """Replay a Twitter cache trace file (CSV, optionally zstd-compressed)."""
     if trace_path.endswith(".zst"):
+        import io
         import zstandard
         with open(trace_path, "rb") as f:
             dctx = zstandard.ZstdDecompressor()
             reader = dctx.stream_reader(f)
-            yield from _parse_trace_lines(reader)
+            text = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+            yield from _parse_trace_lines(text, max_ops)
     else:
         with open(trace_path, "r") as f:
-            yield from _parse_trace_lines(f)
+            yield from _parse_trace_lines(f, max_ops)
 
 
-def _parse_trace_lines(source):
+def _parse_trace_lines(source, max_ops=0):
     """Parse Twitter trace CSV lines into Operations."""
+    count = 0
     for line in source:
         if isinstance(line, bytes):
             line = line.decode("utf-8", errors="replace")
@@ -109,8 +112,14 @@ def _parse_trace_lines(source):
 
         if op in ("get", "gets"):
             yield Operation("get", key, key_size, 0)
+            count += 1
         elif op in ("set", "add", "replace"):
             yield Operation("put", key, key_size, value_size)
+            count += 1
         elif op == "delete":
             yield Operation("delete", key, key_size, 0)
+            count += 1
         # skip cas, append, prepend, incr, decr
+
+        if max_ops > 0 and count >= max_ops:
+            return

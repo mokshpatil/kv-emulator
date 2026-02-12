@@ -127,5 +127,18 @@ def create_policy(config):
             warmup=config.inlining.profiler_warmup,
             interval=config.inlining.profiler_interval,
         )
+    elif mode == "ml_linear":
+        from src.ml_policies import LinearRegressionPolicy
+        return LinearRegressionPolicy(
+            entry_size=entry_size,
+            warmup=config.inlining.profiler_warmup,
+            retrain_interval=config.inlining.profiler_interval,
+        )
+    elif mode == "ml_bandit":
+        from src.ml_policies import EpsilonGreedyPolicy
+        return EpsilonGreedyPolicy(
+            entry_size=entry_size,
+            warmup=config.inlining.profiler_warmup,
+        )
     else:
         raise ValueError(f"unknown inlining mode: {mode}")

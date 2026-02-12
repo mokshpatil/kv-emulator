@@ -31,6 +31,12 @@ class CMT:
     def invalidate(self, key_hash: int):
         self._read_cache.pop(key_hash, None)
 
+    def update_data_page(self, old_page_id: int, new_page_id: int):
+        # update cached entries when GC relocates a data page
+        for entry in self._read_cache.values():
+            if not entry.is_inline and entry.data_page_id == old_page_id:
+                entry.data_page_id = new_page_id
+
     def mark_dirty(self, tp_id: int):
         # track translation pages that have pending writes
         while len(self._write_cache) >= self.write_capacity:

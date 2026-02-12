@@ -3,19 +3,23 @@ from src.metrics import Metrics
 from src.flash import Flash
 from src.mapping import GMD, MappingEntry, compute_key_hash
 from src.cmt import CMT
+from src.gc import GarbageCollector
 from src.inlining import InlineContext, create_policy
 
 
 class KVSSD:
     def __init__(self, config: SSDConfig):
         self.config = config
-        self.metrics = Metrics()
+        self.metrics = Metrics(read_latency_us=config.flash.read_latency_us)
         self.flash = Flash(config, self.metrics)
         self.gmd = GMD(config, self.flash, self.metrics)
 
         read_cap, write_cap = config.cmt_entry_capacity
         self.cmt = CMT(read_cap, write_cap)
         self.policy = create_policy(config)
+
+        self.gc = GarbageCollector(self.flash, self.metrics)
+        self.gc.set_relocators(self._relocate_data_page, self._relocate_tp_page)
 
     def get(self, key: bytes) -> bool:
         self.metrics.total_gets += 1
@@ -28,10 +32,7 @@ class KVSSD:
         if entry is not None:
             self.metrics.cmt_hits += 1
             if not entry.is_inline:
-                # need to read the data page
                 self.flash.read_page(entry.data_page_id, "data")
-            # inline entries in CMT: value was already available (but KVPack
-            # policy doesn't cache inline entries, so this path is rare)
             self.metrics.end_get_request()
             return True
 
@@ -43,40 +44,54 @@ class KVSSD:
             self.metrics.end_get_request()
             return False
 
-        # reading the translation page from flash
+        # read the translation page from flash
         self.flash.read_page(tp.flash_page_id, "translation")
 
         if entry.is_inline:
-            # value is in the translation page, no extra read needed
+            self._send_feedback(entry, flash_reads=1)
             self.metrics.end_get_request()
             return True
 
         # regular entry: cache it in CMT, then read data page
         self.cmt.insert(key_hash, entry)
         self.flash.read_page(entry.data_page_id, "data")
+        self._send_feedback(entry, flash_reads=2)
         self.metrics.end_get_request()
         return True
 
+    def _send_feedback(self, entry, flash_reads):
+        # provide reward signal to ML policies
+        if not hasattr(self.policy, "feedback"):
+            return
+        ctx = InlineContext(
+            key_size=entry.key_size,
+            value_size=entry.value_size,
+            cmt_hit_rate=self.metrics.cmt_hit_rate,
+        )
+        self.policy.feedback(ctx, entry.is_inline, flash_reads)
+
     def put(self, key: bytes, value_size: int):
         self.metrics.total_puts += 1
+        self.metrics.host_writes += 1
         key_hash = compute_key_hash(key, self.config.hash_mask)
         key_size = len(key) if isinstance(key, bytes) else len(key.encode())
 
-        # feed the profiler
         ctx = InlineContext(
             key_size=key_size,
             value_size=value_size,
             cmt_hit_rate=self.metrics.cmt_hit_rate,
         )
         self.policy.update(ctx)
-
-        # decide inline or regular
         should_inline = self.policy.should_inline(ctx)
 
         if should_inline:
             self._put_inline(key_hash, key_size, value_size)
         else:
             self._put_regular(key_hash, key_size, value_size)
+
+        # trigger GC if flash utilization is high
+        if self.gc.should_run():
+            self.gc.run()
 
     def _put_inline(self, key_hash, key_size, value_size):
         # compute frames needed: 8B hash + 2B key_len + 2B val_len + value
@@ -85,11 +100,9 @@ class KVSSD:
 
         tp = self.gmd.find_tp_for_insert(key_hash, frames)
         if tp is None:
-            # no space with probing, fall back to regular
             self._put_regular(key_hash, key_size, value_size)
             return
 
-        # check if we need to evict an inline entry to make room
         if not tp.has_space(frames):
             evicted = tp.evict_one_inline()
             if evicted is not None:
@@ -116,7 +129,6 @@ class KVSSD:
         if tp is None:
             return
 
-        # allocate a data page and write the value
         data_page = self.flash.allocate_page()
         self.flash.write_page(data_page, "data")
 
@@ -134,7 +146,6 @@ class KVSSD:
         self.metrics.regular_entries += 1
 
     def _convert_to_regular(self, tp, old_entry):
-        # convert an evicted inline entry to a regular entry
         data_page = self.flash.allocate_page()
         self.flash.write_page(data_page, "data")
 
@@ -171,3 +182,19 @@ class KVSSD:
             if entry.data_page_id >= 0:
                 self.flash.free_page(entry.data_page_id)
         return True
+
+    def _relocate_data_page(self, old_page_id, new_page_id):
+        # update all mapping entries and CMT entries pointing to old_page_id
+        for tp in self.gmd._pages.values():
+            for entry in tp.entries.values():
+                if not entry.is_inline and entry.data_page_id == old_page_id:
+                    entry.data_page_id = new_page_id
+        # update CMT cached entries
+        self.cmt.update_data_page(old_page_id, new_page_id)
+
+    def _relocate_tp_page(self, old_page_id, new_page_id):
+        # update the translation page's flash_page_id
+        for tp in self.gmd._pages.values():
+            if tp.flash_page_id == old_page_id:
+                tp.flash_page_id = new_page_id
+                return
