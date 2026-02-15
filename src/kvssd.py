@@ -20,6 +20,19 @@ class KVSSD:
 
         self.gc = GarbageCollector(self.flash, self.metrics)
         self.gc.set_relocators(self._relocate_data_page, self._relocate_tp_page)
+        self._epoch = 0
+        self._gc_retries = 0
+
+    def _allocate_with_gc(self):
+        # try to allocate; on flash-full, force GC and retry
+        try:
+            return self.flash.allocate_page()
+        except RuntimeError:
+            rounds = self.gc.run(max_rounds=self.flash.total_blocks, force=True)
+            self._gc_retries += 1
+            if rounds == 0:
+                raise RuntimeError("flash full: GC could not reclaim any space")
+            return self.flash.allocate_page()
 
     def get(self, key: bytes) -> bool:
         self.metrics.total_gets += 1
@@ -63,24 +76,36 @@ class KVSSD:
         # provide reward signal to ML policies
         if not hasattr(self.policy, "feedback"):
             return
-        ctx = InlineContext(
-            key_size=entry.key_size,
-            value_size=entry.value_size,
-            cmt_hit_rate=self.metrics.cmt_hit_rate,
-        )
+        ctx = self._build_context(entry.key_hash, entry.key_size, entry.value_size)
         self.policy.feedback(ctx, entry.is_inline, flash_reads)
+
+    def _build_context(self, key_hash, key_size, value_size):
+        # look up TP for utilization/inline_ratio context
+        tp_util, tp_inl = 0.0, 0.0
+        tp = self.gmd.get_tp(self.gmd._get_tp_id(key_hash, 0))
+        if tp is not None:
+            tp_util = tp.utilization
+            tp_inl = tp.inline_ratio
+        return InlineContext(
+            key_size=key_size,
+            value_size=value_size,
+            tp_utilization=tp_util,
+            tp_inline_ratio=tp_inl,
+            cmt_hit_rate=self.metrics.cmt_hit_rate,
+            epoch=self._epoch,
+        )
 
     def put(self, key: bytes, value_size: int):
         self.metrics.total_puts += 1
         self.metrics.host_writes += 1
+        self._epoch += 1
         key_hash = compute_key_hash(key, self.config.hash_mask)
         key_size = len(key) if isinstance(key, bytes) else len(key.encode())
 
-        ctx = InlineContext(
-            key_size=key_size,
-            value_size=value_size,
-            cmt_hit_rate=self.metrics.cmt_hit_rate,
-        )
+        # free old data page if overwriting an existing regular entry
+        self._free_old_entry(key_hash)
+
+        ctx = self._build_context(key_hash, key_size, value_size)
         self.policy.update(ctx)
         should_inline = self.policy.should_inline(ctx)
 
@@ -92,6 +117,13 @@ class KVSSD:
         # trigger GC if flash utilization is high
         if self.gc.should_run():
             self.gc.run()
+
+    def _free_old_entry(self, key_hash):
+        # find and free old data page when overwriting a key
+        _tp, old_entry = self.gmd.find_entry(key_hash)
+        if old_entry is not None and not old_entry.is_inline:
+            if old_entry.data_page_id >= 0:
+                self.flash.free_page(old_entry.data_page_id)
 
     def _put_inline(self, key_hash, key_size, value_size):
         # compute frames needed: 8B hash + 2B key_len + 2B val_len + value
@@ -129,7 +161,7 @@ class KVSSD:
         if tp is None:
             return
 
-        data_page = self.flash.allocate_page()
+        data_page = self._allocate_with_gc()
         self.flash.write_page(data_page, "data")
 
         entry = MappingEntry(
@@ -146,7 +178,7 @@ class KVSSD:
         self.metrics.regular_entries += 1
 
     def _convert_to_regular(self, tp, old_entry):
-        data_page = self.flash.allocate_page()
+        data_page = self._allocate_with_gc()
         self.flash.write_page(data_page, "data")
 
         new_entry = MappingEntry(

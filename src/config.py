@@ -78,3 +78,12 @@ def small_config():
         capacity_bytes=256 * (1024 ** 2),  # 256MB
         inlining=InliningConfig(profiler_warmup=1000, profiler_interval=500),
     )
+
+
+def gc_config():
+    # tight config that forces GC to trigger with modest workloads
+    return SSDConfig(
+        capacity_bytes=2 * (1024 ** 2),  # 2MB = 128 pages
+        flash=FlashConfig(page_size=16384, pages_per_block=16),
+        inlining=InliningConfig(profiler_warmup=50, profiler_interval=50),
+    )

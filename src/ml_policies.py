@@ -12,8 +12,8 @@ class LinearRegressionPolicy:
         self.lr = lr
         self.retrain_interval = retrain_interval
 
-        # weight vector: [value_size_norm, total_size_norm, cmt_miss_rate]
-        self.weights = [0.0, 0.0, 0.0]
+        # features: [value_size_norm, total_size_norm, cmt_miss_rate, tp_util, tp_inline_ratio]
+        self.weights = [0.0, 0.0, 0.0, 0.0, 0.0]
         self.bias = 0.0
 
         self._rng = random.Random(42)
@@ -28,6 +28,8 @@ class LinearRegressionPolicy:
             ctx.value_size / self.entry_size,
             total / (self.entry_size * 16),
             1.0 - ctx.cmt_hit_rate,
+            ctx.tp_utilization,
+            ctx.tp_inline_ratio,
         ]
 
     def should_inline(self, ctx: InlineContext) -> bool:

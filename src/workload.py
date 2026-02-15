@@ -30,6 +30,7 @@ def synthetic_workload(
     num_keys: int,
     num_ops: int,
     read_ratio: float = 0.5,
+    delete_ratio: float = 0.0,
     seed: int = 42,
 ):
     """Generate a synthetic workload matching a KVPack profile."""
@@ -45,13 +46,17 @@ def synthetic_workload(
     for key in keys:
         yield Operation("put", key, key_size, value_size)
 
-    # phase 2: mixed read/write
+    # phase 2: mixed read/write/delete
+    write_ratio = 1.0 - read_ratio - delete_ratio
     for _ in range(num_ops):
         key = rng.choice(keys)
-        if rng.random() < read_ratio:
+        r = rng.random()
+        if r < read_ratio:
             yield Operation("get", key, key_size, 0)
-        else:
+        elif r < read_ratio + write_ratio:
             yield Operation("put", key, key_size, value_size)
+        else:
+            yield Operation("delete", key, key_size, 0)
 
 
 def uniform_workload(

@@ -20,15 +20,18 @@ class GarbageCollector:
     def should_run(self):
         return self.flash.utilization >= self.threshold
 
-    def run(self, max_rounds=10):
+    def run(self, max_rounds=10, force=False):
         # run GC until utilization drops below threshold or no victim found
         rounds = 0
-        while self.should_run() and rounds < max_rounds:
+        while rounds < max_rounds:
+            if not force and not self.should_run():
+                break
             victim = self._select_victim()
             if victim is None:
                 break
             self._collect_block(victim)
             rounds += 1
+            force = False  # only force the first round
         return rounds
 
     def _select_victim(self):
